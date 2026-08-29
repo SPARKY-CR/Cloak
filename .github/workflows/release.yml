@@ -29,9 +29,9 @@ jobs:
           CC: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
         run: |
           mkdir -p out/src
-          $CC -O2 -Wall -o out/cloak cloak.c -lpthread
-          $CC -O2 -Wall -o out/cloakscan cloakscan.c -lpthread
-          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c -lpthread
+          $CC -O2 -Wall -o out/cloak cloak.c
+          $CC -O2 -Wall -o out/cloakscan cloakscan.c
+          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c
           cp cloak.c cloakscan.c cloaklinks.c out/src/
           cd out && zip -r ../cloak-arm64-v8a.zip .
       - uses: actions/upload-artifact@v4
@@ -53,9 +53,9 @@ jobs:
           CC: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
         run: |
           mkdir -p out/src
-          $CC -O2 -Wall -o out/cloak cloak.c -lpthread
-          $CC -O2 -Wall -o out/cloakscan cloakscan.c -lpthread
-          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c -lpthread
+          $CC -O2 -Wall -o out/cloak cloak.c
+          $CC -O2 -Wall -o out/cloakscan cloakscan.c
+          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c
           cp cloak.c cloakscan.c cloaklinks.c out/src/
           cd out && zip -r ../cloak-armeabi-v7a.zip .
       - uses: actions/upload-artifact@v4
@@ -102,9 +102,9 @@ jobs:
             ## cloak ${{ github.ref_name }}
 
             Pick the zip for your device and extract it, or just run:
-            ```bash
+```bash
             curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Cloak/main/install.sh | bash
-            ```
+```
             which auto-detects your architecture and installs to `~/cloak/`.
 
             **Manual download** -- if you're not sure which one you need,
