@@ -1,0 +1,125 @@
+name: Build and Release
+
+# Runs automatically whenever you push a tag that looks like a
+# version number, e.g. v1.0, v1.1, v2.0 ...
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ------------------------------------------------------------------
+  # Three independent build jobs, one per architecture. Each produces
+  # ONE zip: the three compiled tools (flat, no subfolder) + a src/
+  # folder with the source, as a fallback in case the binary doesn't
+  # run on someone's specific device.
+  # ------------------------------------------------------------------
+
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Cross-compile for arm64-v8a
+        env:
+          CC: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang
+        run: |
+          mkdir -p out/src
+          $CC -O2 -Wall -o out/cloak cloak.c -lpthread
+          $CC -O2 -Wall -o out/cloakscan cloakscan.c -lpthread
+          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c -lpthread
+          cp cloak.c cloakscan.c cloaklinks.c out/src/
+          cd out && zip -r ../cloak-arm64-v8a.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloak-arm64-v8a
+          path: cloak-arm64-v8a.zip
+
+  build-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r26d
+      - name: Cross-compile for armeabi-v7a
+        env:
+          CC: ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi24-clang
+        run: |
+          mkdir -p out/src
+          $CC -O2 -Wall -o out/cloak cloak.c -lpthread
+          $CC -O2 -Wall -o out/cloakscan cloakscan.c -lpthread
+          $CC -O2 -Wall -o out/cloaklinks cloaklinks.c -lpthread
+          cp cloak.c cloakscan.c cloaklinks.c out/src/
+          cd out && zip -r ../cloak-armeabi-v7a.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloak-armeabi-v7a
+          path: cloak-armeabi-v7a.zip
+
+  build-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile for x86_64 (Linux/WSL)
+        run: |
+          mkdir -p out/src
+          gcc -O2 -Wall -o out/cloak cloak.c -lpthread
+          gcc -O2 -Wall -o out/cloakscan cloakscan.c -lpthread
+          gcc -O2 -Wall -o out/cloaklinks cloaklinks.c -lpthread
+          cp cloak.c cloakscan.c cloaklinks.c out/src/
+          cd out && zip -r ../cloak-x86_64.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cloak-x86_64
+          path: cloak-x86_64.zip
+
+  # ------------------------------------------------------------------
+  # Waits for all three builds, then publishes a single Release with
+  # all three zips attached as separate downloads.
+  # ------------------------------------------------------------------
+
+  release:
+    needs: [build-arm64, build-armv7, build-x86_64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          body: |
+            ## cloak ${{ github.ref_name }}
+
+            Pick the zip for your device and extract it, or just run:
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/SPARKY-CR/Cloak/main/install.sh | bash
+            ```
+            which auto-detects your architecture and installs to `~/cloak/`.
+
+            **Manual download** -- if you're not sure which one you need,
+            `arm64-v8a` covers almost all phones from the last several years:
+
+            | File | For |
+            |---|---|
+            | `cloak-arm64-v8a.zip` | Most modern Android phones |
+            | `cloak-armeabi-v7a.zip` | Older 32-bit Android phones |
+            | `cloak-x86_64.zip` | Linux PC / WSL |
+
+            Each zip contains the three compiled tools (`cloak`, `cloakscan`,
+            `cloaklinks`) plus a `src/` folder with the source as a fallback,
+            in case the binary doesn't run on your specific device.
+          files: |
+            artifacts/cloak-arm64-v8a.zip
+            artifacts/cloak-armeabi-v7a.zip
+            artifacts/cloak-x86_64.zip
