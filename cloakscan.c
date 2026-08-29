@@ -93,6 +93,7 @@ static unsigned int safe_rand(void) {
 
 #define MAX_RANGES 16
 #define MAX_SNIS   32
+#define MAX_PORTS  8
 
 typedef struct {
     int family;             /* AF_INET or AF_INET6 */
@@ -108,7 +109,8 @@ typedef struct {
     char sni_list[MAX_SNIS][256];
     int  sni_count;
 
-    int port;
+    int  ports[MAX_PORTS];
+    int  port_count; /* one is picked at random per probe, same as sni_list */
     int samples_per_range; /* how many random IPs to try per range */
     int concurrency;       /* max simultaneous probes */
     int timeout_ms;
@@ -124,7 +126,7 @@ typedef struct {
 static ScanConfig g_cfg = {
     .range_count = 0,
     .sni_count = 0,
-    .port = 443,
+    .port_count = 0,
     .samples_per_range = 40,
     .concurrency = 20,
     .timeout_ms = 2000,
@@ -217,10 +219,24 @@ static void parse_snis(const char *value) {
     }
 }
 
+static void parse_ports(const char *value) {
+    char buf[256];
+    strncpy(buf, value, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    g_cfg.port_count = 0;
+    char *tok = strtok(buf, ",");
+    while (tok && g_cfg.port_count < MAX_PORTS) {
+        g_cfg.ports[g_cfg.port_count++] = atoi(trim(tok));
+        tok = strtok(NULL, ",");
+    }
+}
+
 static void apply_setting(const char *key, const char *value) {
     if (!strcasecmp(key, "ranges")) parse_ranges(value);
     else if (!strcasecmp(key, "sni_list")) parse_snis(value);
-    else if (!strcasecmp(key, "port")) g_cfg.port = atoi(value);
+    else if (!strcasecmp(key, "ports")) parse_ports(value);
+    else if (!strcasecmp(key, "port")) parse_ports(value); /* old singular key, still accepted */
     else if (!strcasecmp(key, "samples_per_range")) g_cfg.samples_per_range = atoi(value);
     else if (!strcasecmp(key, "concurrency")) g_cfg.concurrency = atoi(value);
     else if (!strcasecmp(key, "timeout_ms")) g_cfg.timeout_ms = atoi(value);
@@ -268,7 +284,14 @@ static void write_example_config(const char *path) {
 "# likely served via Cloudflare.\n"
 "sni_list = www.hcaptcha.com, www.speedtest.net, www.bing.com, www.cloudflare.com\n"
 "\n"
-"port = 443\n"
+"# Candidate ports to test each sampled IP on, one picked at random\n"
+"# per probe (same idea as sni_list above). These are Cloudflare's\n"
+"# published HTTPS-capable ports -- matches cloak.conf's\n"
+"# fallback_ports, so an IP that's only reachable on a non-443 port\n"
+"# still gets found and correctly kept alive by prune_dead_entries,\n"
+"# instead of being wrongly treated as dead just because 443 alone\n"
+"# didn't answer.\n"
+"ports = 443, 2053, 2083, 2087, 2096, 8443\n"
 "\n"
 "# How many random IPs to sample from EACH range above. Keep this\n"
 "# modest on a phone connection -- each sample is a real connection\n"
@@ -479,7 +502,7 @@ static int probe_existing_entry(const char *hostport, const char *sni) {
     }
 }
 
-static int probe_one(const IpRange *range, const char *sni, char *ip_str_out) {
+static int probe_one(const IpRange *range, const char *sni, int port, char *ip_str_out) {
     if (range->family == AF_INET) {
         uint32_t host_bits = 32 - range->prefix;
         uint32_t range_size = (host_bits >= 32) ? 0xFFFFFFFFu : (1u << host_bits);
@@ -493,7 +516,7 @@ static int probe_one(const IpRange *range, const char *sni, char *ip_str_out) {
         struct sockaddr_in dst;
         memset(&dst, 0, sizeof(dst));
         dst.sin_family = AF_INET;
-        dst.sin_port = htons((uint16_t)g_cfg.port);
+        dst.sin_port = htons((uint16_t)port);
         dst.sin_addr = a;
         return probe_sockaddr((struct sockaddr *)&dst, sizeof(dst), AF_INET, sni);
     } else {
@@ -522,7 +545,7 @@ static int probe_one(const IpRange *range, const char *sni, char *ip_str_out) {
         struct sockaddr_in6 dst;
         memset(&dst, 0, sizeof(dst));
         dst.sin6_family = AF_INET6;
-        dst.sin6_port = htons((uint16_t)g_cfg.port);
+        dst.sin6_port = htons((uint16_t)port);
         dst.sin6_addr = addr;
         return probe_sockaddr((struct sockaddr *)&dst, sizeof(dst), AF_INET6, sni);
     }
@@ -605,13 +628,14 @@ static void record_found(const char *ip, int port, const char *sni) {
 typedef struct {
     IpRange range;
     char sni[256];
+    int port;
 } ProbeTask;
 
 static void *probe_worker(void *arg) {
     ProbeTask *task = (ProbeTask *)arg;
     char ip_str[INET6_ADDRSTRLEN];
 
-    int ok = probe_one(&task->range, task->sni, ip_str);
+    int ok = probe_one(&task->range, task->sni, task->port, ip_str);
 
     /* IPv6 addresses need bracket notation in cloak.conf's connect_list
      * syntax ([2606:4700::1]:443), since the address itself is full of
@@ -623,17 +647,17 @@ static void *probe_worker(void *arg) {
     if (ok) {
         g_found++;
         if (is_v6)
-            fprintf(g_out, "[%s]:%d  sni=%s\n", ip_str, g_cfg.port, task->sni);
+            fprintf(g_out, "[%s]:%d  sni=%s\n", ip_str, task->port, task->sni);
         else
-            fprintf(g_out, "%s:%d  sni=%s\n", ip_str, g_cfg.port, task->sni);
+            fprintf(g_out, "%s:%d  sni=%s\n", ip_str, task->port, task->sni);
         fflush(g_out);
 
         char combo_host[INET6_ADDRSTRLEN + 2];
         if (is_v6) snprintf(combo_host, sizeof(combo_host), "[%s]", ip_str);
         else strncpy(combo_host, ip_str, sizeof(combo_host) - 1);
-        record_found(combo_host, g_cfg.port, task->sni);
+        record_found(combo_host, task->port, task->sni);
 
-        log_line("[FOUND %4d/%-4d] %s -> %s", g_tried, g_total, ip_str, task->sni);
+        log_line("[FOUND %4d/%-4d] %s:%d -> %s", g_tried, g_total, ip_str, task->port, task->sni);
     } else if (g_tried % 10 == 0) {
         log_line("[progress %4d/%-4d] %d found so far", g_tried, g_total, g_found);
     }
@@ -790,6 +814,7 @@ int main(int argc, char **argv) {
 
     if (g_cfg.range_count == 0) { log_line("error: no valid 'ranges' configured"); return 1; }
     if (g_cfg.sni_count == 0) parse_snis("www.hcaptcha.com,www.speedtest.net,www.bing.com");
+    if (g_cfg.port_count == 0) parse_ports("443,2053,2083,2087,2096,8443");
 
     g_out = fopen(g_cfg.output_path, "w");
     if (!g_out) { log_line("error: cannot open output file '%s'", g_cfg.output_path); return 1; }
@@ -813,6 +838,7 @@ int main(int argc, char **argv) {
             task->range = g_cfg.ranges[r]; /* random offset is picked inside probe_one() */
             const char *sni = g_cfg.sni_list[safe_rand() % g_cfg.sni_count];
             strncpy(task->sni, sni, sizeof(task->sni) - 1);
+            task->port = g_cfg.ports[safe_rand() % g_cfg.port_count];
 
             sem_acquire(&g_sem);
             pthread_create(&threads[tcount], NULL, probe_worker, task);

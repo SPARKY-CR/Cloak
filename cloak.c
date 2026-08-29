@@ -158,9 +158,10 @@ static int safe_rand(void) {
 
 #define MAX_SNI_LIST     16
 #define MAX_TTL_LIST     8
-#define MAX_SERVER_LIST  8
+#define MAX_SERVER_LIST  32
 #define MAX_FRAG_LENGTHS 8
 #define MAX_CIPHERS      24
+#define MAX_FALLBACK_PORTS 8
 
 typedef struct {
     char host[64];
@@ -173,6 +174,9 @@ typedef struct {
 
     ServerAddr servers[MAX_SERVER_LIST];
     int  server_count;
+
+    int  fallback_ports[MAX_FALLBACK_PORTS];
+    int  fallback_port_count;
 
     char sni_list[MAX_SNI_LIST][256];
     int  sni_count;
@@ -194,6 +198,8 @@ typedef struct {
     int decoy_cipher_count;              /* 0 = use the built-in default list */
 
     int  adaptive;      /* use cloak.stats to reorder ttl/server attempts */
+    int  randomize_sni_case; /* mIx.CaSe on the decoy SNI */
+    int  summary_interval_sec; /* how often the INFO-level heartbeat line prints */
 
     char stats_path[256];
     char log_file_path[256]; /* empty = stderr */
@@ -202,6 +208,7 @@ typedef struct {
 static Config g_cfg = {
     .listen_port   = 40443,
     .server_count  = 0,
+    .fallback_port_count = 0,
     .sni_count     = 0,
     .ttl_count     = 0,
     .jitter_min_ms = 20,
@@ -211,6 +218,8 @@ static Config g_cfg = {
     .fragment_length_count = 0,
     .decoy_cipher_count = 0,
     .adaptive      = 1,
+    .randomize_sni_case = 0,
+    .summary_interval_sec = 60,
     .stats_path    = "cloak.stats",
     .log_file_path = "",
 };
@@ -306,11 +315,33 @@ static void parse_decoy_ciphers(const char *value) {
     }
 }
 
+/* connect_list entries are parsed in two steps now, not one:
+ *   1. parse_one_server() below just records host/family, and the
+ *      port IF one was explicitly given (0 means "not given").
+ *   2. expand_servers(), called once from main() after the whole
+ *      config file has been read, turns each raw entry into one or
+ *      more actual ServerAddr entries in g_cfg.servers -- one per
+ *      port if no port was given, using fallback_ports.
+ * This two-step split exists because fallback_ports might appear
+ * AFTER connect_list in the config file; if expansion happened
+ * immediately while parsing connect_list, it could run before
+ * fallback_ports had been read yet and silently use an empty list.
+ * Doing it as a separate pass after the whole file is read removes
+ * that ordering dependency entirely. */
+typedef struct {
+    char host[64];
+    int  family;
+    int  port; /* 0 = not given, expand across fallback_ports */
+} RawServerEntry;
+
+static RawServerEntry g_raw_servers[MAX_SERVER_LIST];
+static int g_raw_server_count = 0;
+
 static void parse_one_server(char *entry) {
-    if (g_cfg.server_count >= MAX_SERVER_LIST) return;
+    if (g_raw_server_count >= MAX_SERVER_LIST) return;
     char *e = trim(entry);
     char host[64];
-    int port = 443;
+    int port = 0; /* 0 = not explicitly given */
 
     if (e[0] == '[') {
         /* IPv6 literal in bracket notation: [2606:4700::1]:443
@@ -355,12 +386,12 @@ static void parse_one_server(char *entry) {
         return;
     }
 
-    ServerAddr *s = &g_cfg.servers[g_cfg.server_count];
-    strncpy(s->host, host, sizeof(s->host) - 1);
-    s->host[sizeof(s->host) - 1] = '\0';
-    s->port = port;
-    s->family = family;
-    g_cfg.server_count++;
+    RawServerEntry *r = &g_raw_servers[g_raw_server_count];
+    strncpy(r->host, host, sizeof(r->host) - 1);
+    r->host[sizeof(r->host) - 1] = '\0';
+    r->family = family;
+    r->port = port;
+    g_raw_server_count++;
 }
 
 static void parse_connect_list(const char *value) {
@@ -368,11 +399,62 @@ static void parse_connect_list(const char *value) {
     strncpy(buf, value, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    g_cfg.server_count = 0;
+    g_raw_server_count = 0;
     char *tok = strtok(buf, ",");
     while (tok) {
         parse_one_server(tok);
         tok = strtok(NULL, ",");
+    }
+}
+
+static void parse_fallback_ports(const char *value) {
+    char buf[256];
+    strncpy(buf, value, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    g_cfg.fallback_port_count = 0;
+    char *tok = strtok(buf, ",");
+    while (tok && g_cfg.fallback_port_count < MAX_FALLBACK_PORTS) {
+        g_cfg.fallback_ports[g_cfg.fallback_port_count++] = atoi(trim(tok));
+        tok = strtok(NULL, ",");
+    }
+}
+
+/* Turns g_raw_servers into g_cfg.servers: entries with an explicit
+ * port become exactly one ServerAddr; entries without one become one
+ * ServerAddr PER PORT in fallback_ports, so cloak's existing racing
+ * logic (which already tries every entry in g_cfg.servers at once
+ * and uses whichever answers first) automatically also races across
+ * ports -- no separate port-fallback mechanism was needed, this
+ * reuses the same one that already handles multiple IPs. */
+static void expand_servers(void) {
+    g_cfg.server_count = 0;
+    for (int i = 0; i < g_raw_server_count; i++) {
+        RawServerEntry *r = &g_raw_servers[i];
+
+        if (r->port != 0) {
+            if (g_cfg.server_count >= MAX_SERVER_LIST) {
+                LOGW("config", "connect_list has more entries than fit (max %d), truncating", MAX_SERVER_LIST);
+                break;
+            }
+            ServerAddr *s = &g_cfg.servers[g_cfg.server_count++];
+            strncpy(s->host, r->host, sizeof(s->host) - 1);
+            s->host[sizeof(s->host) - 1] = '\0';
+            s->port = r->port;
+            s->family = r->family;
+        } else {
+            for (int j = 0; j < g_cfg.fallback_port_count; j++) {
+                if (g_cfg.server_count >= MAX_SERVER_LIST) {
+                    LOGW("config", "connect_list expansion hit the max of %d entries, truncating", MAX_SERVER_LIST);
+                    return;
+                }
+                ServerAddr *s = &g_cfg.servers[g_cfg.server_count++];
+                strncpy(s->host, r->host, sizeof(s->host) - 1);
+                s->host[sizeof(s->host) - 1] = '\0';
+                s->port = g_cfg.fallback_ports[j];
+                s->family = r->family;
+            }
+        }
     }
 }
 
@@ -386,6 +468,8 @@ static void apply_setting(const char *key, const char *value) {
         g_cfg.listen_port = atoi(value);
     } else if (!strcasecmp(key, "connect_list")) {
         parse_connect_list(value);
+    } else if (!strcasecmp(key, "fallback_ports")) {
+        parse_fallback_ports(value);
     } else if (!strcasecmp(key, "sni_list")) {
         parse_sni_list(value);
     } else if (!strcasecmp(key, "ttl_list")) {
@@ -404,6 +488,10 @@ static void apply_setting(const char *key, const char *value) {
         parse_decoy_ciphers(value);
     } else if (!strcasecmp(key, "adaptive")) {
         g_cfg.adaptive = as_bool(value);
+    } else if (!strcasecmp(key, "randomize_sni_case")) {
+        g_cfg.randomize_sni_case = as_bool(value);
+    } else if (!strcasecmp(key, "summary_interval_sec")) {
+        g_cfg.summary_interval_sec = atoi(value);
     } else if (!strcasecmp(key, "log_level")) {
         if (!strcasecmp(value, "error"))      g_log_level = LOG_ERROR;
         else if (!strcasecmp(value, "warn"))  g_log_level = LOG_WARN;
@@ -505,7 +593,19 @@ static void write_example_config(const char *path) {
 "# destination through plaintext DNS before cloak gets a chance to\n"
 "# hide anything.\n"
 "# Format: ip:port, ip:port, ...  (IPv6 needs brackets: [2606:4700::1]:443)\n"
-"connect_list = 104.18.38.202:443, 104.18.39.100:443\n"
+"# If you leave the :port off an entry (just the bare IP), cloak\n"
+"# automatically expands it into one entry PER PORT in\n"
+"# fallback_ports below, and races all of them together -- handy if\n"
+"# your ISP blocks port 443 specifically rather than the IP itself.\n"
+"# Give an explicit :port to pin a specific IP to just that port.\n"
+"connect_list = 104.18.38.202, 104.18.39.100:443, [2606:4700::1]\n"
+"\n"
+"# Cloudflare's other published HTTPS-capable ports, used to expand\n"
+"# any connect_list entry that didn't specify its own port. Only\n"
+"# these specific ports work for HTTPS through Cloudflare -- plain\n"
+"# port 80 is HTTP-only and carries no TLS/SNI to hide, so it's\n"
+"# deliberately not in this list.\n"
+"fallback_ports = 443, 2053, 2083, 2087, 2096, 8443\n"
 "\n"
 "# Allowed/innocuous domain names used as the decoy SNI. One is\n"
 "# picked at random for each new connection so the pattern isn't\n"
@@ -557,12 +657,27 @@ static void write_example_config(const char *path) {
 "# best-performing ones first on future connections.\n"
 "adaptive = true\n"
 "\n"
+"# true/false -- randomly flips the case of letters in the decoy SNI\n"
+"# per connection (e.g. \"www.bing.com\" -> \"wWw.BiNg.CoM\"). Real\n"
+"# servers match hostnames case-insensitively, so this changes\n"
+"# nothing about whether the decoy itself works -- it only helps\n"
+"# against older/simpler DPI that does an exact case-sensitive string\n"
+"# match on the SNI. Most modern DPI normalizes case first and won't\n"
+"# be affected either way, so treat this as a minor extra, not a fix\n"
+"# for a specific problem.\n"
+"randomize_sni_case = false\n"
+"\n"
+"# How often (seconds) the INFO-level heartbeat line prints, e.g.\n"
+"# \"alive -- 42 connection(s) (39 ok, 3 failed) in the last 60s\".\n"
+"summary_interval_sec = 60\n"
+"\n"
 "# How much detail to log: error, warn, info, or debug.\n"
 "#   error - only real failures\n"
 "#   warn  - + rejected config entries, unusual conditions\n"
-"#   info  - + one line per connection (recommended for daily use)\n"
-"#   debug - + every individual decoy packet and TTL/stats detail\n"
-"#            (recommended only while tuning, it's noisy)\n"
+"#   info  - + a periodic one-line summary every summary_interval_sec\n"
+"#            (recommended for daily use -- no per-connection spam)\n"
+"#   debug - + every individual decoy packet, real connection, and\n"
+"#            TTL/stats detail (recommended only while tuning, noisy)\n"
 "log_level = info\n"
 "\n"
 "# Leave empty to log to the terminal (stderr). Set a path to also\n"
@@ -900,6 +1015,7 @@ static int calibrate_ttl(const ServerAddr *srv) {
 
 static int reserve_ephemeral_port(int family) {
     int fd = socket(family, SOCK_STREAM, 0);
+    if (fd < 0) return 0; /* signal "no port reserved" -- caller treats 0 as harmless */
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 #ifdef SO_REUSEPORT
@@ -961,8 +1077,35 @@ static const char *pick_random_sni(void) {
     return g_cfg.sni_list[safe_rand() % g_cfg.sni_count];
 }
 
+/* Randomly flips the case of each letter in the decoy SNI (e.g.
+ * "www.bing.com" -> "wWw.BiNg.CoM"). Real servers match hostnames
+ * case-insensitively, so this changes nothing about whether the
+ * decoy handshake itself succeeds -- it only changes what exact
+ * bytes are on the wire. Some simpler/older DPI systems match SNI
+ * with a case-sensitive exact string compare and can be fooled by
+ * this; most modern DPI normalizes case before matching and won't
+ * be affected either way. Writes into `out` (caller-provided buffer,
+ * must be at least as long as `sni` including the null terminator). */
+static void randomize_sni_case(const char *sni, char *out, size_t out_cap) {
+    size_t len = strlen(sni);
+    if (len + 1 > out_cap) len = out_cap - 1;
+    for (size_t i = 0; i < len; i++) {
+        char c = sni[i];
+        if (isalpha((unsigned char)c) && (safe_rand() % 2)) {
+            c = isupper((unsigned char)c) ? (char)tolower((unsigned char)c) : (char)toupper((unsigned char)c);
+        }
+        out[i] = c;
+    }
+    out[len] = '\0';
+}
+
 static void send_one_decoy(const ServerAddr *srv, int shared_port, int ttl, int use_shared_port) {
     const char *sni = pick_random_sni();
+    char cased_sni[256];
+    if (g_cfg.randomize_sni_case) {
+        randomize_sni_case(sni, cased_sni, sizeof(cased_sni));
+        sni = cased_sni;
+    }
 
     int fd = socket(srv->family, SOCK_STREAM, 0);
     if (fd < 0) { perror("socket(decoy)"); return; }
@@ -1138,12 +1281,14 @@ static int connect_with_timeout(int fd, struct sockaddr *dst, socklen_t dst_len,
 static void *probe_thread(void *arg) {
     ProbeArg *pa = (ProbeArg *)arg;
     int fd = socket(pa->srv.family, SOCK_STREAM, 0);
+    int rc = -1;
 
-    struct sockaddr_storage dst;
-    socklen_t dst_len = fill_sockaddr(&pa->srv, &dst);
-
-    int rc = connect_with_timeout(fd, (struct sockaddr *)&dst, dst_len, 3000); /* genuinely bounded */
-    close(fd); /* this was only a reachability probe */
+    if (fd >= 0) {
+        struct sockaddr_storage dst;
+        socklen_t dst_len = fill_sockaddr(&pa->srv, &dst);
+        rc = connect_with_timeout(fd, (struct sockaddr *)&dst, dst_len, 3000); /* genuinely bounded */
+        close(fd); /* this was only a reachability probe */
+    }
 
     if (rc == 0) {
         pthread_mutex_lock(&pa->state->lock);
@@ -1200,13 +1345,87 @@ static int race_servers(void) {
  * Section 10: per-connection handler
  * ------------------------------------------------------------- */
 
+/* Running totals since the last periodic summary line (see
+ * summary_thread below). Per-connection detail moved to DEBUG level
+ * -- at INFO, this rolled-up count is all that prints, so watching
+ * the log doesn't mean scrolling past a line or two per connection. */
+static pthread_mutex_t g_summary_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_summary_total = 0;
+static int g_summary_ok = 0;
+static int g_summary_failed = 0;
+
+static void record_summary(int ok) {
+    pthread_mutex_lock(&g_summary_lock);
+    g_summary_total++;
+    if (ok) g_summary_ok++; else g_summary_failed++;
+    pthread_mutex_unlock(&g_summary_lock);
+}
+
+/* Reads a COMPLETE TLS record (the real ClientHello) from client_fd,
+ * instead of trusting a single recv() call to have captured all of
+ * it. TCP is a byte stream, not a message protocol -- a client can
+ * (and on real devices, does) deliver a ClientHello across multiple
+ * separate TCP segments, especially over a loopback VpnService tun
+ * interface. A single recv() may only capture the first few bytes
+ * (observed in practice: as few as 4-9 bytes, versus a real
+ * ClientHello's typical 200-600+), and forwarding that truncated
+ * fragment to the real server guarantees the connection fails --
+ * this was a real, confirmed bug, not a network/DPI problem.
+ *
+ * Fix: read the 5-byte TLS record header first, parse its declared
+ * length, then keep reading (looping on recv()) until the full
+ * declared record has arrived, up to the buffer's capacity. Returns
+ * total bytes read, or <=0 on error/timeout/non-TLS-looking data. */
+static ssize_t recv_full_tls_record(int fd, uint8_t *buf, size_t cap) {
+    size_t got = 0;
+
+    /* record header: type(1) + version(2) + length(2) = 5 bytes */
+    while (got < 5) {
+        ssize_t n = recv(fd, buf + got, 5 - got, 0);
+        if (n <= 0) return n; /* closed, error, or timeout */
+        got += (size_t)n;
+    }
+
+    if (buf[0] != 0x16) {
+        /* Not a TLS handshake record -- return what we have as-is;
+         * whatever this is, reading more via TLS-record framing
+         * doesn't apply, so just hand it back unmodified. */
+        return (ssize_t)got;
+    }
+
+    size_t record_len = ((size_t)buf[3] << 8) | buf[4];
+    size_t total_needed = 5 + record_len;
+    if (total_needed > cap) total_needed = cap; /* don't overrun the buffer */
+
+    while (got < total_needed) {
+        ssize_t n = recv(fd, buf + got, total_needed - got, 0);
+        if (n <= 0) break; /* return what we have so far rather than nothing */
+        got += (size_t)n;
+    }
+
+    return (ssize_t)got;
+}
+
 static void *handle_client(void *arg) {
     int client_fd = *(int *)arg;
     free(arg);
 
+    /* Bound how long we wait for the client to finish sending its
+     * ClientHello -- without this, a slow/stalled client could tie
+     * up recv_full_tls_record() indefinitely. */
+    struct timeval hello_tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &hello_tv, sizeof(hello_tv));
+
     uint8_t real_hello[8192];
-    ssize_t hello_len = recv(client_fd, real_hello, sizeof(real_hello), 0);
+    ssize_t hello_len = recv_full_tls_record(client_fd, real_hello, sizeof(real_hello));
     if (hello_len <= 0) { close(client_fd); return NULL; }
+
+    /* Done reading the hello -- clear the timeout so the relay
+     * threads below (which also recv() from client_fd) don't get
+     * spuriously cut off just because the user was idle for a
+     * while during normal use. */
+    struct timeval no_tv2 = {.tv_sec = 0, .tv_usec = 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv2, sizeof(no_tv2));
 
     if (g_cfg.adaptive) {
         reorder_servers_by_stats();
@@ -1216,6 +1435,7 @@ static void *handle_client(void *arg) {
     int winner = race_servers();
     if (winner < 0) {
         LOGE("connect", "no server in connect_list answered in time");
+        record_summary(0);
         close(client_fd);
         return NULL;
     }
@@ -1235,17 +1455,23 @@ static void *handle_client(void *arg) {
     usleep(jitter * 1000);
 
     int server_fd = socket(srv.family, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        LOGE("connect", "socket() failed: %s", strerror(errno));
+        close(client_fd);
+        return NULL;
+    }
     bind_to_port(server_fd, shared_port, srv.family);
 
     struct sockaddr_storage dst;
     socklen_t dst_len = fill_sockaddr(&srv, &dst);
 
     if (connect(server_fd, (struct sockaddr *)&dst, dst_len) < 0) {
-        perror("connect(real server)");
+        LOGD("connect", "connect(real server) failed: %s", strerror(errno));
         if (g_cfg.adaptive) {
             record_server_result(srv.host, srv.port, 0);
             for (int i = 0; i < g_cfg.ttl_count; i++) record_ttl_result(g_cfg.ttl_list[i], 0);
         }
+        record_summary(0);
         close(client_fd); close(server_fd);
         return NULL;
     }
@@ -1255,26 +1481,29 @@ static void *handle_client(void *arg) {
     } else {
         send_all(server_fd, real_hello, (size_t)hello_len);
     }
-    LOGI("connect", "real hello -> %s:%d (%zd bytes, jitter=%dms)",
+    LOGD("connect", "real hello -> %s:%d (%zd bytes, jitter=%dms)",
          srv.host, srv.port, hello_len, jitter);
 
     /* Peek at the server's response to get a real success/fail signal
      * for the adaptive stats, without consuming the bytes (the relay
      * threads below still need to read them from the start). */
+    int summary_ok = 1; /* if adaptive is off, connect() succeeding is our best available signal */
     if (g_cfg.adaptive) {
         struct timeval peek_tv = {.tv_sec = 3, .tv_usec = 0};
         setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &peek_tv, sizeof(peek_tv));
         uint8_t peek[8];
         ssize_t got = recv(server_fd, peek, sizeof(peek), MSG_PEEK);
         int success = (got > 0 && peek[0] == 0x16); /* looks like a TLS record */
+        summary_ok = success;
 
         record_server_result(srv.host, srv.port, success);
         for (int i = 0; i < g_cfg.ttl_count; i++) record_ttl_result(g_cfg.ttl_list[i], success);
-        LOGI("stats", "connection marked %s", success ? "success" : "failure");
+        LOGD("stats", "connection marked %s", success ? "success" : "failure");
 
         struct timeval no_tv = {.tv_sec = 0, .tv_usec = 0};
         setsockopt(server_fd, SOL_SOCKET, SO_RCVTIMEO, &no_tv, sizeof(no_tv));
     }
+    record_summary(summary_ok);
 
     RelayArgs *a1 = malloc(sizeof(RelayArgs)); a1->from_fd = client_fd; a1->to_fd = server_fd;
     RelayArgs *a2 = malloc(sizeof(RelayArgs)); a2->from_fd = server_fd; a2->to_fd = client_fd;
@@ -1295,12 +1524,14 @@ static void *handle_client(void *arg) {
 /* ---------------------------------------------------------------
  * Section 12: graceful shutdown (Ctrl+C / SIGTERM)
  *
- * The signal handler itself only does two things that are safe to do
- * from inside a signal handler (POSIX "async-signal-safe" functions):
- * set a flag, and close() the listening socket. Closing it is what
- * actually unblocks the accept() call in the main loop below --
- * accept() has no idea a signal happened otherwise, it would just
- * keep blocking forever waiting for a connection that may never come.
+ * The signal handler only sets a flag (the one thing that's both
+ * simple and safe to do from inside a signal handler). The accept
+ * loop itself polls the listening socket with a short timeout and
+ * rechecks that flag on every iteration, instead of blocking in
+ * accept() indefinitely -- closing a listening fd from a different
+ * thread does NOT reliably unblock another thread's concurrent
+ * accept() on that same fd on Linux, so relying on that would risk
+ * hanging on shutdown (confirmed by testing this directly).
  *
  * Honest limitation: this stops accepting NEW connections and exits
  * cleanly, but any connections already being relayed are detached
@@ -1313,12 +1544,35 @@ static void *handle_client(void *arg) {
  * ------------------------------------------------------------- */
 
 static volatile sig_atomic_t g_shutdown_requested = 0;
-static int g_listen_fd = -1;
 
 static void handle_shutdown_signal(int sig) {
     (void)sig;
     g_shutdown_requested = 1;
-    if (g_listen_fd >= 0) close(g_listen_fd); /* unblocks accept() */
+}
+
+/* Wakes up once per summary_interval_sec, prints one rolled-up line
+ * at INFO level, and resets the counters for the next interval.
+ * Sleeps in 1-second steps (instead of one long sleep()) so it also
+ * notices g_shutdown_requested promptly instead of delaying process
+ * exit by up to the full interval. */
+static void *summary_thread(void *arg) {
+    (void)arg;
+    int interval = g_cfg.summary_interval_sec > 0 ? g_cfg.summary_interval_sec : 60;
+
+    while (!g_shutdown_requested) {
+        for (int i = 0; i < interval && !g_shutdown_requested; i++) sleep(1);
+        if (g_shutdown_requested) break;
+
+        pthread_mutex_lock(&g_summary_lock);
+        int total = g_summary_total, ok = g_summary_ok, failed = g_summary_failed;
+        g_summary_total = 0; g_summary_ok = 0; g_summary_failed = 0;
+        pthread_mutex_unlock(&g_summary_lock);
+
+        int pct = (total > 0) ? (int)((100.0 * ok) / total) : 0;
+        LOGI("status", "last %ds: %d total, %d ok (%d%%), %d failed",
+             interval, total, ok, pct, failed);
+    }
+    return NULL;
 }
 
 int main(int argc, char **argv) {
@@ -1347,6 +1601,13 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* fallback_ports must be finalized BEFORE expand_servers() runs,
+     * since portless connect_list entries expand across exactly this
+     * list -- and expand_servers() itself must run before checking
+     * whether we ended up with any usable servers at all. */
+    if (g_cfg.fallback_port_count == 0) parse_fallback_ports("443,2053,2083,2087,2096,8443");
+    expand_servers();
+
     if (g_cfg.server_count == 0) {
         LOGE("config", "'connect_list' is empty (or every entry was rejected as a "
              "non-IP domain name) in %s", config_path);
@@ -1358,7 +1619,10 @@ int main(int argc, char **argv) {
     load_stats();
 
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    g_listen_fd = listen_fd; /* so the signal handler can close it */
+    if (listen_fd < 0) {
+        LOGE("listen", "socket() failed: %s", strerror(errno));
+        return 1;
+    }
     int yes = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 
@@ -1374,36 +1638,70 @@ int main(int argc, char **argv) {
     }
     listen(listen_fd, 64);
 
-    printf("cloak: config loaded from %s (stats: %s)\n", config_path, g_cfg.stats_path);
-    printf("listening on 127.0.0.1:%d (Ctrl+C to stop)\n", g_cfg.listen_port);
-    printf("servers (%d): ", g_cfg.server_count);
-    for (int i = 0; i < g_cfg.server_count; i++)
-        printf("%s%s%s:%d ", g_cfg.servers[i].family == AF_INET6 ? "[" : "",
-               g_cfg.servers[i].host, g_cfg.servers[i].family == AF_INET6 ? "]" : "",
-               g_cfg.servers[i].port);
-    printf("\nsni list (%d): ", g_cfg.sni_count);
-    for (int i = 0; i < g_cfg.sni_count; i++) printf("%s ", g_cfg.sni_list[i]);
-    printf("\nttl list (%d): ", g_cfg.ttl_count);
-    for (int i = 0; i < g_cfg.ttl_count; i++) printf("%d ", g_cfg.ttl_list[i]);
-    printf("\njitter=%d-%dms calibrate=%d fragment=%d adaptive=%d\n\n",
-           g_cfg.jitter_min_ms, g_cfg.jitter_max_ms, g_cfg.calibrate,
-           g_cfg.fragment_real, g_cfg.adaptive);
+    /* Count unique IPs (as opposed to unique host:port entries) just
+     * for the startup banner -- e.g. "18 configured (7 unique IPs x
+     * up to 6 ports)" is far more readable than listing all 18. The
+     * full per-entry list is still available at log_level=debug via
+     * the [decoy]/[connect] lines already printed during real use. */
+    int unique_ip_count = 0;
+    for (int i = 0; i < g_cfg.server_count; i++) {
+        int seen = 0;
+        for (int j = 0; j < i; j++) {
+            if (g_cfg.servers[j].family == g_cfg.servers[i].family &&
+                !strcmp(g_cfg.servers[j].host, g_cfg.servers[i].host)) { seen = 1; break; }
+        }
+        if (!seen) unique_ip_count++;
+    }
 
-    for (;;) {
+    char sni_join[2048] = "";
+    for (int i = 0; i < g_cfg.sni_count; i++) {
+        strcat(sni_join, g_cfg.sni_list[i]);
+        if (i < g_cfg.sni_count - 1) strcat(sni_join, ", ");
+    }
+    char ttl_join[128] = "";
+    for (int i = 0; i < g_cfg.ttl_count; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), i < g_cfg.ttl_count - 1 ? "%d, " : "%d", g_cfg.ttl_list[i]);
+        strcat(ttl_join, buf);
+    }
+    char fallback_join[128] = "";
+    for (int i = 0; i < g_cfg.fallback_port_count; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), i < g_cfg.fallback_port_count - 1 ? "%d, " : "%d", g_cfg.fallback_ports[i]);
+        strcat(fallback_join, buf);
+    }
+
+    printf("cloak -- listening on 127.0.0.1:%d (Ctrl+C to stop)\n\n", g_cfg.listen_port);
+    printf("  servers:        %d configured (%d unique IPs x up to %d ports)\n",
+           g_cfg.server_count, unique_ip_count, g_cfg.fallback_port_count);
+    printf("  fallback ports: %s\n", fallback_join);
+    printf("  sni list:       %s\n", sni_join);
+    printf("  ttl list:       %s\n", ttl_join);
+    printf("  jitter:         %d-%dms\n", g_cfg.jitter_min_ms, g_cfg.jitter_max_ms);
+    printf("  calibrate:      %s\n", g_cfg.calibrate ? "on" : "off");
+    printf("  fragment:       %s\n", g_cfg.fragment_real ? "on" : "off");
+    printf("  adaptive:       %s\n\n", g_cfg.adaptive ? "on" : "off");
+
+    pthread_t summary_tid;
+    pthread_create(&summary_tid, NULL, summary_thread, NULL);
+    pthread_detach(summary_tid);
+
+    while (!g_shutdown_requested) {
+        struct pollfd pfd = { .fd = listen_fd, .events = POLLIN };
+        int rc = poll(&pfd, 1, 500); /* 500ms -- how quickly Ctrl+C gets noticed */
+        if (rc <= 0) continue;
+
         struct sockaddr_in ca;
         socklen_t cl = sizeof(ca);
         int *cfd = malloc(sizeof(int));
         *cfd = accept(listen_fd, (struct sockaddr *)&ca, &cl);
-        if (*cfd < 0) {
-            free(cfd);
-            if (g_shutdown_requested) break;
-            continue;
-        }
+        if (*cfd < 0) { free(cfd); continue; }
 
         pthread_t tid;
         pthread_create(&tid, NULL, handle_client, cfd);
         pthread_detach(tid);
     }
+    close(listen_fd);
 
     if (g_shutdown_requested) {
         printf("\ncloak: shutting down (signal received)\n");
